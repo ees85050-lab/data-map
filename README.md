@@ -32,8 +32,8 @@ Run `datamap --write` from a timer so the page stays current, and point your age
 ## Quick start
 
 ```sh
-git clone https://github.com/ees85050-lab/datamap.git
-cd datamap/examples/homelab
+git clone https://github.com/ees85050-lab/data-map.git
+cd data-map/examples/homelab
 ./demo.sh        # sets the example files' times, writes datamap.md, runs the queries
 ```
 
