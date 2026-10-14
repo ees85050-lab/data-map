@@ -1,0 +1,492 @@
+#!/usr/bin/env python3
+"""datamap — a generated catalog page for the JSON and JSONL data files on one machine.
+
+The human half lives in the seed (DATAMAP_SEED, default <root>/datamap-seed.md): for each data file, who writes it,
+what one row is, how often it changes, how stale is too stale, which key holds its time, and its gotchas; which
+directories to scan; files deliberately left out; ground rules and example queries, copied onto the page as they are.
+This script adds the measured half: is the file there, how fresh, how big, what format its time key has in the first
+and last rows, and how to read that format in DuckDB.
+
+The reconciliation keeps the page from rotting: every file under a Scan directory whose suffix matches must be
+claimed by a Data or Ignored row, or it's named at the end of the page and --check exits 1.
+
+Read-only, standard library only, no network. duckdb is needed only for --sql.
+Environment: DATAMAP_ROOT (default: the current directory; relative paths in the seed resolve against it),
+DATAMAP_SEED, DATAMAP_OUT (default <root>/datamap.md), DATAMAP_HOME (what ~/ in the seed means; default your home),
+DATAMAP_NOW (epoch seconds; pins the clock for tests and examples), DATAMAP_DUCKDB (default: duckdb on PATH).
+"""
+import datetime as dt
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+USAGE = """usage: datamap [--write | --check | --sql]
+
+  datamap            print the page
+  datamap --write    write the page to DATAMAP_OUT (default <root>/datamap.md) and list what doesn't reconcile; exit 0
+  datamap --check    reconcile only: files on disk no seed row claims, seed rows with no file; exit 1 if any
+  datamap --sql      run every ```sql block in the seed's Queries section through duckdb; exit 1 if any fails"""
+
+ROOT = os.path.abspath(os.environ.get("DATAMAP_ROOT") or os.getcwd())
+SEED = os.environ.get("DATAMAP_SEED") or os.path.join(ROOT, "datamap-seed.md")
+OUT = os.environ.get("DATAMAP_OUT") or os.path.join(ROOT, "datamap.md")
+HOME = os.environ.get("DATAMAP_HOME") or os.path.expanduser("~")
+NOW = float(os.environ.get("DATAMAP_NOW") or time.time())
+DUCKDB = os.environ.get("DATAMAP_DUCKDB") or "duckdb"
+BIG = 200 * 1024 * 1024        # don't count the rows of a file bigger than this
+TAIL = 4 * 1024 * 1024         # read at most this much to find a first or last line
+JSON_MAX = 20 * 1024 * 1024    # don't parse a .json document bigger than this
+SKIP_DIRS = {"__pycache__", ".git", "node_modules", "fixtures", ".venv"}
+SKIP_NAME = re.compile(r"(^\.|\.bak|\.lock$|\.tmp$|~$)")
+DATA_COLS = ["group", "name", "path", "writer", "row", "cadence", "fresh", "time_key", "gotchas"]
+FRESH_RE = re.compile(r"(\d+)([mhd])")
+NONE = ("", "-", "—")
+
+
+# ---------- seed ----------
+def parse_seed(text):
+    """→ {section name in lower case: its lines}."""
+    secs, cur = {}, None
+    for line in text.split("\n"):
+        if line.startswith("## "):
+            cur = line[3:].strip().lower()
+            secs[cur] = []
+        elif cur is not None:
+            secs[cur].append(line)
+    return secs
+
+
+def table(lines):
+    """The rows of a markdown table, without the header row and the separator row."""
+    rows = []
+    for l in lines:
+        if not l.startswith("|"):
+            continue
+        cells = [c.strip() for c in l.strip().strip("|").split("|")]
+        if all(re.fullmatch(r":?-+:?", c) for c in cells):
+            continue
+        rows.append(cells)
+    return rows[1:]
+
+
+def load_seed(path=None):
+    path = path or SEED
+    try:
+        with open(path, encoding="utf-8") as f:
+            secs = parse_seed(f.read())
+    except OSError as e:
+        raise SystemExit(f"datamap: can't read the seed: {e}")
+    data = []
+    for i, r in enumerate(table(secs.get("data", [])), 1):
+        if len(r) != len(DATA_COLS):
+            raise SystemExit(f"datamap: row {i} of the seed's Data table has {len(r)} cells, needs {len(DATA_COLS)}: "
+                             f"{' | '.join(r)[:80]}")
+        row = dict(zip(DATA_COLS, r))
+        if not (FRESH_RE.fullmatch(row["fresh"]) or row["fresh"] in NONE or row["fresh"] == "retired"):
+            raise SystemExit(f"datamap: row {i} of the seed's Data table ({row['name']}): Fresh must be like 30m, 2h "
+                             f"or 2d, or - or retired, not {row['fresh']!r}")
+        data.append(row)
+    scan = []
+    for i, r in enumerate(table(secs.get("scan", [])), 1):
+        try:
+            scan.append({"dir": r[0], "suffixes": [s.strip().lstrip(".") for s in r[1].split(",") if s.strip()],
+                         "depth": int(r[2])})
+        except (IndexError, ValueError):
+            raise SystemExit(f"datamap: row {i} of the seed's Scan table needs Dir | Suffixes | Depth (a number): "
+                             f"{' | '.join(r)[:80]}")
+    ignored = [{"path": r[0], "why": r[1] if len(r) > 1 else ""} for r in table(secs.get("ignored", []))]
+    return {"data": data, "scan": scan, "ignored": ignored,
+            "rules": "\n".join(secs.get("ground rules", [])).strip(),
+            "queries": "\n".join(secs.get("queries", [])).strip()}
+
+
+def absp(p):
+    if p.startswith("~/"):
+        return os.path.join(HOME, p[2:])
+    return os.path.join(ROOT, p)
+
+
+def show(full):
+    if full.startswith(ROOT + os.sep):
+        return os.path.relpath(full, ROOT)
+    if full.startswith(HOME + os.sep):
+        return "~/" + os.path.relpath(full, HOME)
+    return full
+
+
+# ---------- measuring ----------
+def count_lines(path):
+    n = 0
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(1 << 20)
+            if not b:
+                return n
+            n += b.count(b"\n")
+
+
+def edge_lines(path):
+    """The first and the last non-empty line of a JSONL file; None where there's none to read."""
+    first = last = None
+    try:
+        with open(path, "rb") as f:
+            for raw in f:
+                if raw.strip():
+                    first = raw
+                    break
+                if f.tell() > TAIL:
+                    break
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - TAIL))
+            chunk = f.read()
+        lines = [l for l in chunk.split(b"\n") if l.strip()]
+        if lines and (size <= TAIL or len(lines) > 1):   # a cut-off first line of the tail isn't a row
+            last = lines[-1]
+    except OSError:
+        pass
+    return first, last
+
+
+def dig(obj, key):
+    for k in key.split("."):
+        if not isinstance(obj, dict) or k not in obj:
+            return None
+        obj = obj[k]
+    return obj
+
+
+def json_of(raw):
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+
+
+_D = r"\d{4}-\d{2}-\d{2}"
+
+
+def tfmt(v):
+    """A time value → (what it is, a DuckDB expression with {k} for the key, a note), or None if unrecognised.
+    read_json_auto turns some of these formats into timestamps on its own and leaves others as text, and which one
+    depends on details like a T or a space between date and time. tests/test_datamap.py runs every expression
+    through the installed duckdb."""
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, (int, float)):
+        if v > 1e12:
+            return "epoch milliseconds", "to_timestamp({k} / 1000)", ""
+        if v > 1e9:
+            return "epoch seconds", "to_timestamp({k})", ""
+        return None
+    if not isinstance(v, str):
+        return None
+    s = v.strip()
+    local = "it's in whatever clock the writer used"
+    if re.fullmatch(_D, s):
+        return "a date", "{k}", "use as is"
+    if re.fullmatch(_D + r" \d{2}:\d{2}", s):
+        return "a time to the minute with no offset", "{k}::TIMESTAMP", "read_json_auto leaves it text; " + local
+    m = re.fullmatch(_D + r"([T ])\d{2}:\d{2}:\d{2}(\.\d+)?(.*)", s)
+    if not m:
+        return None
+    t, frac, tail = m.group(1) == "T", m.group(2), m.group(3)
+    if tail == "":
+        if t and frac:
+            return "a timestamp with no offset", "{k}::TIMESTAMP", "read_json_auto leaves this form text; " + local
+        return "a timestamp with no offset", "{k}", "use as is; " + local
+    if tail == "Z":
+        if t:
+            return "UTC (ends in Z)", "timezone('UTC', {k})", "read_json_auto reads it as a timestamp with no zone"
+        return "UTC (ends in Z)", "{k}::TIMESTAMPTZ", "read_json_auto leaves this form text"
+    if re.fullmatch(r"[+-]\d{2}:?\d{2}", tail):
+        if t:
+            return ("a timestamp with an offset", "timezone('UTC', {k})",
+                    "read_json_auto converts it to UTC and drops the offset; used as is, it's off by the offset")
+        return ("a timestamp with an offset", "{k}::TIMESTAMPTZ",
+                "read_json_auto leaves this form text; ::TIMESTAMP would drop the offset")
+    if re.fullmatch(r" [+-]\d{2}:?\d{2}", tail):
+        return ("a timestamp with a space before the offset", "regexp_replace({k}, ' ([+-])', '\\1')::TIMESTAMPTZ",
+                "read_json_auto leaves it text, and it won't cast with the space in")
+    return None
+
+
+def to_epoch(v):
+    """A time value → epoch seconds (naive values count as local time), or None."""
+    if not tfmt(v):
+        return None
+    if isinstance(v, (int, float)):
+        return v / 1000 if v > 1e12 else float(v)
+    s = v.strip().replace("T", " ")
+    s = re.sub(r"(\d) ([+-]\d{2}:?\d{2})$", r"\1\2", s)
+    s = re.sub(r"Z$", "+00:00", s)
+    s = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", s)
+    for pat in ("%Y-%m-%d %H:%M:%S.%f%z", "%Y-%m-%d %H:%M:%S%z", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return dt.datetime.strptime(s, pat).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def age_txt(sec):
+    sec = max(0, sec)      # a file written while the page is being generated is newer than NOW
+    if sec < 3600:
+        return f"{int(sec // 60)} min ago"
+    if sec < 86400 * 2:
+        return f"{sec / 3600:.1f} h ago"
+    return f"{sec / 86400:.0f} d ago"
+
+
+def size_txt(n):
+    for u, d in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+        if n >= d:
+            return f"{n / d:.1f}{u}"
+    return f"{n}B"
+
+
+def stamp(t):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(t))
+
+
+def matches(pattern):
+    return sorted(os.path.normpath(f) for f in glob.glob(absp(pattern), recursive=True))
+
+
+def measure(row):
+    files = [f for f in matches(row["path"]) if os.path.isfile(f)]
+    m = {"n": len(files)}
+    if not files:
+        m["fresh"] = "✗ missing"
+        return m
+    newest = max(files, key=os.path.getmtime)
+    mt = os.path.getmtime(newest)
+    m["size"] = sum(os.path.getsize(f) for f in files)
+    m["age"] = age_txt(NOW - mt)
+    fresh = row["fresh"]
+    if FRESH_RE.fullmatch(fresh):
+        n, unit = FRESH_RE.fullmatch(fresh).groups()
+        m["fresh"] = ("✓ " if NOW - mt <= int(n) * {"m": 60, "h": 3600, "d": 86400}[unit] else "✗ ") + m["age"]
+    elif fresh == "retired":
+        m["fresh"] = (f"⚠ retired but still written, last at {stamp(mt)}" if NOW - mt < 2 * 86400
+                      else f"retired, last written {stamp(mt)}")
+    else:
+        m["fresh"] = "— " + m["age"]
+    jl = [f for f in files if f.endswith(".jsonl")]
+    if jl:
+        m["rows"] = None if any(os.path.getsize(f) > BIG for f in jl) else sum(count_lines(f) for f in jl)
+    key = row["time_key"].strip()
+    if key not in NONE:
+        first = last = None
+        # files named by date: the first row comes from the oldest name; otherwise both come from the newest file
+        dated = len(files) > 1 and all(re.search(r"\d{4}-\d{2}-\d{2}", os.path.basename(f)) for f in files)
+        if dated:
+            newest = files[-1]
+        if newest.endswith(".jsonl"):
+            first = dig(json_of(edge_lines(files[0] if dated else newest)[0]), key)
+            last = dig(json_of(edge_lines(newest)[1]), key)
+        elif newest.endswith(".json") and os.path.getsize(newest) <= JSON_MAX:
+            try:
+                with open(newest, encoding="utf-8") as f:
+                    last = dig(json.load(f), key)
+            except (OSError, ValueError):
+                last = None
+        m["t_first"], m["t_last"] = first, last
+        fl, ff = tfmt(last), tfmt(first)
+        m["tfmt"] = fl
+        m["tfmt_mixed"] = bool(ff and fl and ff[1] != fl[1])
+    return m
+
+
+def claimed(seed):
+    """The files Data and Ignored rows claim, and the directories Ignored rows claim whole."""
+    files, dirs = set(), []
+    for r in seed["data"]:
+        files.update(f for f in matches(r["path"]) if os.path.isfile(f))
+    for r in seed["ignored"]:
+        for f in matches(r["path"]):
+            if os.path.isdir(f):
+                dirs.append(f + os.sep)
+            else:
+                files.add(f)
+    return files, tuple(dirs)
+
+
+def scan_disk(seed):
+    """Files under the Scan directories with a listed suffix that no Data or Ignored row claims."""
+    files, dirs = claimed(seed)
+    out = set()
+    for s in seed["scan"]:
+        base = os.path.normpath(absp(s["dir"]))
+        if not os.path.isdir(base):
+            print(f"datamap: scan directory not found: {s['dir']}", file=sys.stderr)
+            continue
+        for dirpath, subdirs, fnames in os.walk(base):
+            depth = 0 if dirpath == base else os.path.relpath(dirpath, base).count(os.sep) + 1
+            subdirs[:] = sorted(d for d in subdirs if d not in SKIP_DIRS and not d.startswith(".")
+                                and depth < s["depth"] and not os.path.join(dirpath, d, "").startswith(dirs))
+            for fn in sorted(fnames):
+                if "." not in fn or SKIP_NAME.search(fn) or fn.rsplit(".", 1)[1] not in s["suffixes"]:
+                    continue
+                full = os.path.join(dirpath, fn)
+                if full not in files and not full.startswith(dirs):
+                    out.add(show(full))
+    return sorted(out)
+
+
+# ---------- the page ----------
+def scale_txt(m):
+    if not m["n"]:
+        return "—"
+    parts = [f"{m['n']} files"] if m["n"] > 1 else []
+    if "rows" in m:
+        parts.append("too big to count rows" if m["rows"] is None else f"{m['rows']} row" + "s" * (m["rows"] != 1))
+    parts.append(size_txt(m["size"]))
+    return ", ".join(parts)
+
+
+def latest_txt(m):
+    v = m.get("t_last")
+    if v is None:
+        return "—"
+    ep = to_epoch(v)
+    return stamp(ep) if ep is not None else str(v)[:25]
+
+
+def entry(r, m):
+    o = [f"### {r['name']}", "",
+         f"- Path: `{r['path']}`" + (f" ({m['n']} files)" if m["n"] > 1 else ""),
+         f"- Writer: {r['writer']}",
+         f"- Each row: {r['row']}"]
+    if not m["n"] or r["fresh"] == "retired":
+        now = m["fresh"]
+    elif r["fresh"] in NONE:
+        now = f"last written {m['age']}"
+    else:
+        now = f"fresh within {r['fresh']}; now {m['fresh']}"
+    o.append("- Cadence: " + "; ".join(([] if r["cadence"] in NONE else [r["cadence"]]) + [now]))
+    key = r["time_key"].strip()
+    if key not in NONE:
+        q = key if "." in key else f'"{key}"'
+        f = m.get("tfmt")
+        if m.get("tfmt_mixed"):
+            o.append(f"- Time: `{key}` has one format in the first row ({str(m.get('t_first'))[:40]}) and another in "
+                     f"the last ({str(m.get('t_last'))[:40]}); check the type DuckDB gives it "
+                     f"(`DESCRIBE SELECT * FROM read_json_auto('…')`) before you use it")
+        elif f:
+            o.append(f"- Time: `{key}` is {f[0]}. In DuckDB: `{f[1].format(k=q)}`" + (f" ({f[2]})" if f[2] else ""))
+        elif m["n"]:
+            o.append(f"- Time: `{key}` isn't in the last row, or its format isn't one datamap knows "
+                     f"(value: {str(m.get('t_last'))[:40]})")
+    if r["gotchas"] not in NONE:
+        o.append(f"- Gotchas: {r['gotchas']}")
+    return o + [""]
+
+
+def render(seed, ms, unreg):
+    data = seed["data"]
+    missing = [r["path"] for r, m in zip(data, ms) if not m["n"]]
+    o = [f"# Data map {stamp(NOW)}", "",
+         f"Generated by datamap from `{show(os.path.abspath(SEED))}`; don't edit this page by hand. Writers, rows and "
+         "gotchas come from the seed; presence, freshness, size and time formats were measured when the page was "
+         "generated. Regenerate with `datamap --write`; reconcile only with `datamap --check`.", ""]
+    if seed["rules"]:
+        o += ["## Ground rules", "", seed["rules"], ""]
+    o += ["## Overview", "", "| Group | Name | Path | Fresh | Size | Last row at |", "|---|---|---|---|---|---|"]
+    o += [f"| {r['group']} | {r['name']} | {r['path']} | {m['fresh']} | {scale_txt(m)} | {latest_txt(m)} |"
+          for r, m in zip(data, ms)]
+    o.append("")
+    for g in dict.fromkeys(r["group"] for r in data):
+        o += [f"## {g}", ""]
+        for r, m in zip(data, ms):
+            if r["group"] == g:
+                o += entry(r, m)
+    if seed["queries"]:
+        o += ["## Queries", "", seed["queries"], ""]
+    o += ["## Reconciliation (disk vs seed)", ""]
+    if unreg:
+        o += [f"**On disk but not in the seed: {len(unreg)}.** Add each to the seed's Data table, or to Ignored if "
+              "it isn't data.", ""] + [f"- {p}" for p in unreg]
+    else:
+        o.append("- On disk but not in the seed: none")
+    o.append("")
+    if missing:
+        o += [f"**In the seed but not on disk: {len(missing)}.** Fix the path if it moved; if it's gone, delete the "
+              "row.", ""] + [f"- {p}" for p in missing]
+    else:
+        o.append("- In the seed but not on disk: none")
+    o += ["", "Scanned: " + ("; ".join(f"{s['dir']} ({', '.join(s['suffixes'])}; depth {s['depth']})" for s in seed["scan"])
+                             or "nothing (the seed has no Scan table)")]
+    if seed["ignored"]:
+        o += ["", "Ignored: " + "; ".join(f"{r['path']} ({r['why']})" if r["why"] else r["path"] for r in seed["ignored"])]
+    return "\n".join(o) + "\n", missing
+
+
+def write_atomic(path, text):
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".datamap.")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    um = os.umask(0)
+    os.umask(um)
+    os.chmod(tmp, 0o666 & ~um)
+    os.replace(tmp, path)
+
+
+def run_sql(seed):
+    blocks = re.findall(r"```sql\n(.*?)```", seed["queries"], re.S)
+    bad = 0
+    for i, b in enumerate(blocks, 1):
+        head = next((l.strip() for l in b.split("\n") if l.strip()), "")[:60]
+        try:
+            r = subprocess.run([DUCKDB, "-c", b], cwd=ROOT, capture_output=True, text=True, timeout=120)
+            ok, why = r.returncode == 0, (r.stderr.strip() or r.stdout.strip()).split("\n")[0][:200]
+        except (OSError, subprocess.TimeoutExpired) as e:
+            ok, why = False, str(e)[:200]
+        bad += not ok
+        print(f"{'ok ' if ok else 'BAD'} block {i}: {head}" + ("" if ok else f" — {why}"))
+    print(f"queries: {len(blocks)} block{'s' * (len(blocks) != 1)}, {bad} bad")
+    return 1 if bad else 0
+
+
+def main(argv):
+    if set(argv) & {"-h", "--help"}:
+        print(USAGE)
+        return 0
+    if len(argv) > 1 or set(argv) - {"--write", "--check", "--sql"}:
+        print(USAGE, file=sys.stderr)
+        return 2
+    seed = load_seed()
+    if "--sql" in argv:
+        return run_sql(seed)
+    ms = [measure(r) for r in seed["data"]]
+    unreg = scan_disk(seed)
+    page, missing = render(seed, ms, unreg)
+    if not argv:
+        sys.stdout.write(page)
+        return 0
+    for p in unreg:
+        print(f"unregistered: {p}")
+    for p in missing:
+        print(f"missing: {p}")
+    stale = sum(1 for m in ms if m["n"] and m["fresh"].startswith("✗"))
+    warn = sum(1 for m in ms if m["fresh"].startswith("⚠"))
+    summary = (f"datamap: {len(ms)} registered, {stale} stale" + (f", {warn} retired but still written" if warn else "")
+               + f"; {len(unreg)} unregistered, {len(missing)} missing")
+    if "--check" in argv:
+        print(summary)
+        return 1 if unreg or missing else 0
+    write_atomic(OUT, page)
+    print(summary + f"; wrote {show(os.path.abspath(OUT))}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

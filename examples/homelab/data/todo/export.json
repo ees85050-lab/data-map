@@ -1,0 +1,39 @@
+{
+  "meta": {
+    "exported_at": "2026-10-11T03:20:00Z",
+    "app": "todo-export",
+    "version": 3
+  },
+  "items": [
+    {
+      "id": 1,
+      "list": "home",
+      "title": "Replace the furnace filter",
+      "done": false
+    },
+    {
+      "id": 2,
+      "list": "home",
+      "title": "Fix the garden tap",
+      "done": true
+    },
+    {
+      "id": 3,
+      "list": "admin",
+      "title": "Renew the domain",
+      "done": false
+    },
+    {
+      "id": 4,
+      "list": "admin",
+      "title": "Back up the NAS",
+      "done": false
+    },
+    {
+      "id": 5,
+      "list": "home",
+      "title": "Call the plumber",
+      "done": false
+    }
+  ]
+}
