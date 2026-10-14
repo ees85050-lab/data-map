@@ -100,6 +100,8 @@ This is what datamap says for each format it recognises, checked against DuckDB 
 | `2026-10-14 10:00:00+02:00` | text | `k::TIMESTAMPTZ` (`::TIMESTAMP` would drop the offset) |
 | `2026-10-14 10:00:00 +0200` | text that won't cast | `regexp_replace(k, ' ([+-])', '\1')::TIMESTAMPTZ` |
 
+On the page, `k` is the key quoted for DuckDB, such as `"at"` or `"meta"."exported_at"`. Keys like `at` and `when` are SQL keywords, and a query that uses them bare fails with a syntax error.
+
 A timestamp without an offset is in whatever clock its writer used, and the page says so. When the first and last rows need different expressions, the page says that instead and suggests checking the column's type with `DESCRIBE`. One common cause is Python's `isoformat()`, which leaves out the fraction when it's zero.
 
 ## Configuration

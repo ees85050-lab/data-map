@@ -153,16 +153,16 @@ class Datamap(unittest.TestCase):
         self.put("d/p/2026-10-09.jsonl", {"t": "2026-10-09 10:00:00"}, age=86400)
         self.put("d/p/2026-10-10.jsonl", {"t": "2026-10-10T10:00:00.5"})
         self.put("d/old.jsonl", {"when": "2026-10-10 21:00:00"}, age=3600)
-        self.put("d/state.json", {"meta": {"saved_at": "2026-10-10T22:00:00Z"}})
+        self.put("d/state.json", {"at": {"saved": "2026-10-10T22:00:00Z"}})
         self.seed(ROW_B + "\n| B | p | d/p/*.jsonl | the test | a reading | daily file | 1d | t | - |"
                   "\n| B | old | d/old.jsonl | nobody now | one event | - | retired | when | - |"
-                  "\n| B | state | d/state.json | the test | the whole file | on change | - | meta.saved_at | - |")
+                  "\n| B | state | d/state.json | the test | the whole file | on change | - | at.saved | - |")
         page = self.run_dm().stdout
         self.assertIn("- Path: `d/p/*.jsonl` (2 files)", page)
         self.assertIn("one format in the first row (2026-10-09 10:00:00) and another in the last (2026-10-10T10:00:00.5)",
                       page)
         self.assertIn("⚠ retired but still written, last at 2026-10-10 21:33", page)
-        self.assertIn("`timezone('UTC', meta.saved_at)`", page)
+        self.assertIn("`timezone('UTC', \"at\".\"saved\")`", page)
         r = self.run_dm("--check")
         self.assertEqual(r.returncode, 0, r.stdout)
         self.assertIn("1 retired but still written", r.stdout)
@@ -203,13 +203,14 @@ class TimeFormats(unittest.TestCase):
             with self.subTest(v=v):
                 p = os.path.join(d, f"s{i}.jsonl")
                 with open(p, "w") as f:
-                    f.write(json.dumps({"k": v}) + "\n" + json.dumps({"k": v}) + "\n")
-                expr = dm.tfmt(v)[1].format(k="k")
-                r = subprocess.run([DUCKDB, "-noheader", "-csv", "-c",
-                                    f"SET TimeZone='UTC'; SELECT epoch({expr}) FROM read_json_auto('{p}') LIMIT 1"],
-                                   capture_output=True, text=True)
-                self.assertEqual(r.returncode, 0, f"{expr}: {r.stderr}")
-                self.assertAlmostEqual(float(r.stdout), want, places=4, msg=expr)
+                    f.write((json.dumps({"k": v, "at": {"when": v}}) + "\n") * 2)
+                for key in ("k", "at.when"):
+                    expr = dm.tfmt(v)[1].format(k=dm.sql_key(key))
+                    r = subprocess.run([DUCKDB, "-noheader", "-csv", "-c",
+                                        f"SET TimeZone='UTC'; SELECT epoch({expr}) FROM read_json_auto('{p}') LIMIT 1"],
+                                       capture_output=True, text=True)
+                    self.assertEqual(r.returncode, 0, f"{expr}: {r.stderr}")
+                    self.assertAlmostEqual(float(r.stdout), want, places=4, msg=expr)
 
 
 if __name__ == "__main__":

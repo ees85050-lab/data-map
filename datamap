@@ -216,6 +216,12 @@ def tfmt(v):
     return None
 
 
+def sql_key(key):
+    """A time key from the seed, dotted for nested keys → a DuckDB column reference. Every part is quoted, because
+    keys like `at` and `when` are SQL keywords and break the query bare."""
+    return ".".join('"' + p.replace('"', '""') + '"' for p in key.split("."))
+
+
 def to_epoch(v):
     """A time value → epoch seconds (naive values count as local time), or None."""
     if not tfmt(v):
@@ -373,7 +379,7 @@ def entry(r, m):
     o.append("- Cadence: " + "; ".join(([] if r["cadence"] in NONE else [r["cadence"]]) + [now]))
     key = r["time_key"].strip()
     if key not in NONE:
-        q = key if "." in key else f'"{key}"'
+        q = sql_key(key)
         f = m.get("tfmt")
         if m.get("tfmt_mixed"):
             o.append(f"- Time: `{key}` has one format in the first row ({str(m.get('t_first'))[:40]}) and another in "
